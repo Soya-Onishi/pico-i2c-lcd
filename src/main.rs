@@ -80,7 +80,9 @@ fn main() -> ! {
         Ok(lcd) => lcd,
         Err(e) => {
             info!("error: {:?}", defmt::Debug2Format(&e));
-            loop {}
+            loop {
+                cortex_m::asm::wfi();
+            }
         }
     };
 
@@ -88,11 +90,13 @@ fn main() -> ! {
         debug!("{:?}\r\n", defmt::Debug2Format(&e));
     }
 
-    loop {}
+    loop {
+        cortex_m::asm::wfi();
+    }
 }
 
-fn lcd_manipulation<'a, I, D>(
-    mut lcd: Lcd<'a, I, D>,
+fn lcd_manipulation<I, D>(
+    mut lcd: Lcd<'_, I, D>,
     timer: bsp::hal::Timer,
 ) -> Result<(), <I as embedded_hal::blocking::i2c::Write>::Error>
 where
