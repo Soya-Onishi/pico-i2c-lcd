@@ -21,10 +21,10 @@ rp-pico = "0.6"
 # If you're not going to use a Board Support Package you'll need these:
 # rp2040-hal = { version="0.6", features=["rt"] }
 # rp2040-boot2 = "0.2"
-
-pcf857x = "0.4"
+lcd-lcm1602-i2c = "0.1"
 fugit = "0.3"
 heapless = "0.7"
+nb = "1.0"
 
 # cargo build/run
 [profile.dev]

@@ -1,73 +1,25 @@
 #![no_std]
 #![no_main]
 
-use bsp::{entry, hal::uart::Enabled};
-use core::{
-    borrow::Borrow,
-    fmt::{self, Write},
-};
+use bsp::entry;
 use defmt::*;
-use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
 use panic_probe as _;
 
-use cortex_m::delay::Delay;
-use pcf857x::{Pcf8574, SlaveAddr};
+use lcd_lcm1602_i2c::Lcd;
 use rp_pico as bsp;
+
+use embedded_hal::timer::CountDown;
 
 use bsp::hal::{
     clocks::{init_clocks_and_plls, Clock},
-    gpio::{
-        bank0::{Gpio0, Gpio1},
-        Function, Output, Pin, PushPull, Uart,
-    },
-    pac::{self, UART0},
+    pac,
     sio::Sio,
     uart::{DataBits, StopBits, UartConfig, UartPeripheral},
     watchdog::Watchdog,
 };
 
-use core::cell::RefCell;
-use cortex_m::interrupt::{free, Mutex};
-
+use fugit::ExtU32;
 use fugit::RateExtU32;
-
-static UART: Mutex<
-    RefCell<
-        Option<
-            UartPeripheral<
-                Enabled,
-                UART0,
-                (Pin<Gpio0, Function<Uart>>, Pin<Gpio1, Function<Uart>>),
-            >,
-        >,
-    >,
-> = Mutex::new(RefCell::new(None));
-
-struct UartWriter<'a>(
-    &'a UartPeripheral<Enabled, UART0, (Pin<Gpio0, Function<Uart>>, Pin<Gpio1, Function<Uart>>)>,
-);
-
-macro_rules! print {
-    ($($arg:tt)*) => {
-        $crate::_print(format_args!($($arg)*));
-    };
-}
-
-fn _print(args: fmt::Arguments) {
-    free(|cs| {
-        let uart = UART.borrow(cs).borrow();
-        let uart = uart.as_ref().unwrap();
-        let mut writer = UartWriter(uart);
-        writer.write_fmt(args).unwrap();
-    });
-}
-
-impl Write for UartWriter<'_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.write_full_blocking(s.as_bytes());
-        Ok(())
-    }
-}
 
 #[entry]
 fn main() -> ! {
@@ -89,15 +41,14 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
+    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-    let mut led_pin = pins.led.into_push_pull_output();
 
     // Construct UART
     let uart_pins = (pins.gpio0.into_mode(), pins.gpio1.into_mode());
@@ -109,9 +60,9 @@ fn main() -> ! {
         .unwrap();
 
     defmt_serial::defmt_serial(uart);
-    defmt::info!("ready to logging");
+    info!("ready to logging\r\n");
 
-    let i2c = bsp::hal::i2c::I2C::i2c0(
+    let mut i2c = bsp::hal::i2c::I2C::i2c0(
         pac.I2C0,
         pins.gpio4.into_mode(),
         pins.gpio5.into_mode(),
@@ -120,50 +71,57 @@ fn main() -> ! {
         clocks.system_clock.freq(),
     );
 
-    delay.delay_ms(500);
-
-    let mut pcf8574a = Pcf8574::new(i2c, SlaveAddr::Alternative(true, true, true));
-    let init_commands = [
-        0b0011_0000,
-        0b0011_0000,
-        0b0011_0000,
-        0b0010_0000,
-        //function set command
-        0b0010_1000,
-        0b0000_1000,
-        // display command
-        0b0000_1000,
-        0b1110_1000,
-        // entry mode set
-        0b0000_1000,
-        0b0110_1000,
-        //write `A`
-        0b0100_1001,
-        0b1000_1001,
-    ];
-    for c in init_commands {
-        if let Err(e) = pcf8574a.set(c | 0b0000_0100) {
-            print!("{:?}\r\n", e);
-            led_pin.set_high().unwrap();
+    let lcd = match Lcd::new(&mut i2c, &mut delay)
+        .address(0x27)
+        .cursor_on(false)
+        .rows(2)
+        .init()
+    {
+        Ok(lcd) => lcd,
+        Err(e) => {
+            info!("error: {:?}", defmt::Debug2Format(&e));
+            loop {}
         }
+    };
 
-        delay.delay_ms(20);
-
-        if let Err(e) = pcf8574a.set(c) {
-            print!("{:?}\r\n", e);
-            led_pin.set_high().unwrap();
-        }
-
-        delay.delay_ms(20);
+    if let Err(e) = lcd_manipulation(lcd, timer) {
+        debug!("{:?}\r\n", defmt::Debug2Format(&e));
     }
 
     loop {}
 }
 
-fn debug_toggle(
-    led: &mut Pin<bsp::hal::gpio::pin::bank0::Gpio25, Output<PushPull>>,
-    delay: &mut Delay,
-) {
-    led.toggle();
-    delay.delay_ms(1000);
+fn lcd_manipulation<'a, I, D>(
+    mut lcd: Lcd<'a, I, D>,
+    timer: bsp::hal::Timer,
+) -> Result<(), <I as embedded_hal::blocking::i2c::Write>::Error>
+where
+    I: embedded_hal::blocking::i2c::Write,
+    I::Error: core::fmt::Debug,
+    D: embedded_hal::blocking::delay::DelayMs<u8>,
+{
+    let mut count_down = timer.count_down();
+    loop {
+        lcd.clear()?;
+        lcd.return_home()?;
+        lcd.write_str("Hello World")?;
+        lcd.set_cursor(1, 0)?;
+        lcd.write_str("From Rust")?;
+
+        debug!("Hello World From Rust\r\n");
+
+        count_down.start(1_000.millis());
+        let _ = nb::block!(count_down.wait());
+
+        lcd.clear()?;
+        lcd.return_home()?;
+        lcd.write_str("This is a Test")?;
+        lcd.set_cursor(1, 0)?;
+        lcd.write_str("Message For You")?;
+
+        debug!("This is a Test Message For You\r\n");
+
+        count_down.start(1_000.millis());
+        let _ = nb::block!(count_down.wait());
+    }
 }
